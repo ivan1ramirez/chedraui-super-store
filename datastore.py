@@ -68,3 +68,44 @@ def seed_if_empty(db=None) -> int:
                                         precio_nuevo=h["nuevo"], fecha=fecha))
     db.commit()
     return len(rows)
+
+
+def load_catalog(db=None) -> dict:
+    """Arranque de la web: BD vacía -> siembra completa; BD con datos -> actualiza precios/stock desde el JSON.
+
+    Así, cada despliegue (p. ej. tras el commit diario de la Action) deja la tienda con los precios más recientes
+    sin perder los pedidos guardados en la BD.
+    """
+    db = db or SessionLocal()
+    if not os.path.exists(PRODUCTS_JSON):
+        return {"nuevos": 0, "actualizados": 0}
+    if db.query(Product).count() == 0:
+        return {"nuevos": seed_if_empty(db), "actualizados": 0}
+    with open(PRODUCTS_JSON, encoding="utf-8") as f:
+        rows = json.load(f)
+    existing = {p.sku: p for p in db.query(Product)}
+    nuevos = actualizados = 0
+    for r in rows:
+        p = existing.get(r["sku"])
+        stock, disp = r.get("stock", 0), r.get("disponible", True)
+        if p is None:
+            db.add(Product(
+                sku=r["sku"], nombre=r["nombre"], marca=r.get("marca"), precio_actual=r["precio"],
+                precio_chedraui_referencia=r.get("precio_referencia", r["precio"]),
+                categoria_supermercado=r.get("categoria"), url_imagen=r.get("imagen"),
+                url_chedraui=r.get("url"), stock=stock, disponible=disp))
+            nuevos += 1
+            continue
+        price_changed = abs(p.precio_actual - r["precio"]) > 0.001
+        if price_changed or p.stock != stock or p.disponible != disp or p.nombre != r["nombre"] \
+                or p.categoria_supermercado != r.get("categoria"):
+            if price_changed:
+                db.add(PriceHistory(producto_id=p.id, precio_anterior=p.precio_actual, precio_nuevo=r["precio"]))
+            p.nombre, p.marca = r["nombre"], r.get("marca")
+            p.precio_actual = r["precio"]
+            p.precio_chedraui_referencia = r.get("precio_referencia", r["precio"])
+            p.categoria_supermercado, p.url_imagen = r.get("categoria"), r.get("imagen")
+            p.url_chedraui, p.stock, p.disponible = r.get("url"), stock, disp
+            actualizados += 1
+    db.commit()
+    return {"nuevos": nuevos, "actualizados": actualizados}

@@ -93,8 +93,15 @@ curl -X POST http://localhost:5000/api/sync-chedraui \
 3. Corre a diario (11:00 UTC) o manualmente (*Actions → Run workflow*; deja `max_pages` vacío para la sincronización completa).
 4. Hace commit de `data/products.json` y `data/price_history.jsonl` solo si hubo cambios.
 
-## 7. Despliegue
+## 7. Despliegue en Render
 
-Render, Railway o Fly.io con `gunicorn app:app`. La BD se siembra sola desde `data/products.json`, pero los **pedidos**
-viven en SQLite: usa disco persistente o, para tráfico real, cambia `DATABASE_URL` a PostgreSQL. Define `ADMIN_TOKEN`,
-claves de Stripe y `PUBLIC_URL` como variables de entorno del servicio.
+1. Sube el repositorio a GitHub (incluye `render.yaml`).
+2. En [render.com](https://render.com): **New + → Blueprint** → elige el repositorio → **Apply**.
+3. Completa las variables que pide (`PUBLIC_URL`, claves de Stripe si las usas). `ADMIN_TOKEN` se genera solo.
+4. Cuando termine el deploy, copia la URL (`https://<nombre>.onrender.com`) y ponla en `PUBLIC_URL` (Environment) → se redespliega.
+5. Comprueba `https://<tu-url>/healthz` y la tienda.
+
+- `autoDeploy`: el commit diario de la Action redespliega la web; al arrancar, `app.py` actualiza precios y stock desde `data/products.json` sin tocar los pedidos.
+- **Pedidos**: con SQLite en el plan gratuito se pierden al redesplegar. Para conservarlos, crea una base PostgreSQL en Render y pega su *Internal Database URL* en la variable `DATABASE_URL`.
+- El plan gratuito duerme el servicio tras un rato sin visitas (la primera carga tarda). Un plan de pago evita esto.
+- Stripe en producción: añade un webhook (`checkout.session.completed`) y usa claves `sk_live_…` solo cuando tu negocio esté listo.

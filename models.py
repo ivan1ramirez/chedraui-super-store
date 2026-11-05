@@ -9,6 +9,8 @@ from sqlalchemy.orm import (DeclarativeBase, Mapped, mapped_column,
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{os.path.join(BASE_DIR, 'data', 'store.db')}")
+if DATABASE_URL.startswith("postgres://"):  # Render/Heroku entregan este esquema; SQLAlchemy 2 exige postgresql://
+    DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
 
 
 def utcnow() -> datetime:
@@ -78,7 +80,8 @@ class Order(Base):
 
 
 os.makedirs(os.path.join(BASE_DIR, "data"), exist_ok=True)
-engine = create_engine(DATABASE_URL, future=True)
+engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True,
+                       connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {})
 SessionLocal = scoped_session(sessionmaker(bind=engine, expire_on_commit=False))
 
 

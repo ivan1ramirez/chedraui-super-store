@@ -29,14 +29,19 @@ if STRIPE_SECRET_KEY:
     stripe = _stripe
 
 init_db()
-from datastore import seed_if_empty  # noqa: E402
-seed_if_empty()  # si la BD está vacía, se carga desde data/products.json
+from datastore import load_catalog  # noqa: E402
+load_catalog()  # BD vacía -> siembra; si no, actualiza precios desde data/products.json
 _sync_lock = threading.Lock()
 
 
 @app.teardown_appcontext
 def shutdown_session(_exc=None):
     SessionLocal.remove()
+
+
+@app.route("/healthz")
+def healthz():
+    return jsonify({"status": "ok"})
 
 
 # ----------------------------------------------------------------- páginas

@@ -1,0 +1,30 @@
+# Blueprint de Render: https://render.com/docs/infrastructure-as-code
+# En Render: New + -> Blueprint -> elige tu repositorio. Los valores marcados sync:false te los pedirá en el panel.
+services:
+  - type: web
+    name: super-en-linea
+    runtime: python
+    plan: free                      # cámbialo a "starter" para evitar que el servicio se duerma
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 2 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
+    healthCheckPath: /healthz
+    autoDeploy: true                # cada push (incluido el commit diario de la Action) redespliega
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: ADMIN_TOKEN
+        generateValue: true         # Render genera un token aleatorio; léelo en Environment
+      - key: PUBLIC_URL
+        sync: false                 # tu URL pública, p. ej. https://super-en-linea.onrender.com
+      - key: STRIPE_SECRET_KEY
+        sync: false                 # opcional: vacío = pasarela simulada
+      - key: STRIPE_PUBLISHABLE_KEY
+        sync: false
+      - key: IVA_RATE
+        value: "0.16"
+      - key: MARKUP_PCT
+        value: "0"
+      # Para conservar los pedidos entre despliegues, crea una base PostgreSQL en Render y pega aquí su
+      # "Internal Database URL" (variable DATABASE_URL). Sin ella se usa SQLite efímera: los pedidos se pierden al redesplegar.
+      # - key: DATABASE_URL
+      #   sync: false
