@@ -2,20 +2,19 @@
 Scraper del departamento de Supermercado de Chedraui México (VTEX).
 
 Estrategia:
-  1. Consulta el árbol de categorías público de VTEX (/api/catalog_system/pub/category/tree/N)
-     y se queda SOLO con las ramas de supermercado (lista blanca + lista negra de palabras).
-  2. Pagina el endpoint de búsqueda JSON (/api/catalog_system/pub/products/search).
-  3. Limpia precios, hace upsert idempotente por SKU y registra PriceHistory sólo si cambió.
-  4. Exporta data/products.json.
+  1. Consulta el árbol de categorías público de VTEX y se queda SOLO con las ramas de supermercado
+     (lista blanca + lista negra de palabras).
+  2. Pagina el endpoint JSON de búsqueda. VTEX limita cada consulta a 2,500 resultados: si una categoría
+     llega a ese tope, se divide automáticamente en sus subcategorías.
+  3. Limpia precios y hace upsert idempotente por SKU (PriceHistory solo si cambió el precio).
+  4. Exporta data/products.json (un producto por línea) y añade los cambios a data/price_history.jsonl.
+  5. En una sincronización COMPLETA sin errores, los productos que ya no aparecen se marcan no disponibles.
 
 Uso:
-    python scraper.py                  # requests (rápido)
-    python scraper.py --browser        # Playwright headless (si requests es bloqueado)
-    python scraper.py --max-pages 2    # prueba corta
-    python scraper.py --categories 12/45,12/46   # rutas de categoría manuales (sobrescribe autodescubrimiento)
-
-NOTA: los endpoints son los típicos de VTEX; Chedraui puede cambiarlos o bloquear bots.
-Revisa los términos de uso del sitio y mantén un ritmo de peticiones bajo.
+    python scraper.py                    # requests (rápido)
+    python scraper.py --browser          # Playwright headless
+    python scraper.py --max-pages 2      # prueba corta
+    python scraper.py --categories 2/21  # rutas de categoría manuales (idRaiz/idHija)
 """
 from __future__ import annotations
 
@@ -30,32 +29,36 @@ from typing import Any, Iterable
 
 import requests
 
-from models import BASE_DIR, PriceHistory, Product, SessionLocal, init_db
+from datastore import append_history, export_json, seed_if_empty
+from models import PriceHistory, Product, SessionLocal, init_db, utcnow
 
 BASE_URL = "https://www.chedraui.com.mx"
 CATEGORY_TREE_URL = BASE_URL + "/api/catalog_system/pub/category/tree/{depth}"
 SEARCH_URL = BASE_URL + "/api/catalog_system/pub/products/search"
 
 PAGE_SIZE = 50            # VTEX permite máx. 50 por petición
-VTEX_MAX_OFFSET = 2500    # VTEX no pagina más allá de ~2500 resultados por consulta
+VTEX_MAX_OFFSET = 2500    # VTEX no pagina más allá de 2,500 resultados por consulta
+TREE_DEPTH = 4
 REQUEST_TIMEOUT = float(os.getenv("SCRAPER_TIMEOUT", "20"))
 SLEEP_SECONDS = float(os.getenv("SCRAPER_SLEEP", "1.5"))
 MARKUP_PCT = float(os.getenv("MARKUP_PCT", "0"))  # margen sobre el precio de Chedraui
 
-# Categorías raíz/hijas que SÍ nos interesan (comparación sin acentos, minúsculas)
+# Categorías raíz que SÍ interesan (comparación sin acentos, minúsculas)
 INCLUDE_KEYWORDS = [
-    "super", "despensa", "abarrotes", "lacteos", "lácteos", "fruta", "verdura", "carne",
+    "super", "despensa", "abarrotes", "lacteos", "fruta", "verdura", "carne",
     "pollo", "pescado", "marisco", "salchichoneria", "embutido", "panaderia", "tortiller",
-    "bebidas", "cerveza", "vinos", "licores", "congelado", "snack", "botana", "cereal",
+    "bebidas", "cerveza", "congelado", "snack", "botana", "cereal",
     "galleta", "huevo", "queso", "yogur", "aceite", "arroz", "frijol", "pasta", "enlatado",
-    "limpieza", "cuidado personal", "bebes", "bebés", "mascota", "canasta",
+    "limpieza", "cuidado personal", "canasta",
 ]
-# Departamentos que se IGNORAN explícitamente
+# Departamentos / categorías que se IGNORAN explícitamente (nivel raíz y nivel 2)
 EXCLUDE_KEYWORDS = [
     "tecnologia", "electronica", "electrodomestico", "linea blanca", "hogar", "muebles",
     "ropa", "moda", "calzado", "jugueteria", "juguete", "deportes", "automotriz", "ferreteria",
     "videojuego", "computo", "celular", "television", "pantalla", "colchon", "jardin",
     "libreria", "papeleria", "viaje",
+    # excluidas por decisión del negocio:
+    "mascota", "vinos", "licores", "bebes",
 ]
 # Nombre de la(s) raíz(ces) del departamento de supermercado en el árbol VTEX
 SUPER_ROOT_NAMES = ["supermercado", "super", "despensa"]
@@ -92,11 +95,14 @@ def clean_price(value: Any) -> float | None:
     return round(price, 2) if price > 0 else None
 
 
+def is_excluded(name: str) -> bool:
+    n = norm(name)
+    return any(norm(k) in n for k in EXCLUDE_KEYWORDS)
+
+
 def is_super_category(name: str) -> bool:
     n = norm(name)
-    if any(norm(k) in n for k in EXCLUDE_KEYWORDS):
-        return False
-    return any(norm(k) in n for k in INCLUDE_KEYWORDS)
+    return not is_excluded(name) and any(norm(k) in n for k in INCLUDE_KEYWORDS)
 
 
 # --------------------------------------------------------------------------- transporte
@@ -139,7 +145,7 @@ class Fetcher:
                     continue
                 log.warning("HTTP %s en %s", status, url)
                 return None
-            except (requests.RequestException, json.JSONDecodeError, Exception) as exc:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 log.warning("Error %s en %s (intento %d)", exc, url, attempt)
                 time.sleep(SLEEP_SECONDS * attempt)
         return None
@@ -152,29 +158,34 @@ class Fetcher:
 
 
 # --------------------------------------------------------------------------- categorías
-def discover_categories(fetcher: Fetcher, tree: list | None = None) -> list[tuple[str, str]]:
-    """Devuelve [(ruta_vtex, nombre)]; ruta = "idRaiz/idHija" para subcategorías (necesario en fq=C:/ruta/)."""
+def build_node(n: dict, parent_path: str = "") -> dict:
+    path = f"{parent_path}/{n['id']}" if parent_path else str(n["id"])
+    return {"path": path, "name": n["name"],
+            "children": [build_node(c, path) for c in (n.get("children") or [])]}
+
+
+def discover_categories(fetcher: Fetcher | None, tree: list | None = None) -> list[dict]:
+    """Nodos {path, name, children} de supermercado. path = "idRaiz/idHija" (necesario en fq=C:/ruta/)."""
     if tree is None:
-        tree = fetcher.get_json(CATEGORY_TREE_URL.format(depth=3)) or []
-    result: list[tuple[str, str]] = []
+        tree = fetcher.get_json(CATEGORY_TREE_URL.format(depth=TREE_DEPTH)) or []
+    result: list[dict] = []
     for root in tree:
         root_name = norm(root.get("name", ""))
         if any(root_name == r or root_name.startswith(r) for r in SUPER_ROOT_NAMES):
             children = root.get("children") or []
             if children:
                 for ch in children:
-                    if not any(norm(k) in norm(ch["name"]) for k in EXCLUDE_KEYWORDS):
-                        result.append((f'{root["id"]}/{ch["id"]}', ch["name"]))
+                    if not is_excluded(ch["name"]):
+                        result.append(build_node(ch, str(root["id"])))
             else:
-                result.append((root["id"], root["name"]))
+                result.append(build_node(root))
         elif is_super_category(root.get("name", "")):
-            result.append((str(root["id"]), root["name"]))  # raíz suelta tipo "Lácteos"
-    # dedup
+            result.append(build_node(root))  # raíz suelta tipo "Lácteos"
     seen, out = set(), []
-    for cid, name in result:
-        if cid not in seen:
-            seen.add(cid)
-            out.append((cid, name))
+    for node in result:
+        if node["path"] not in seen:
+            seen.add(node["path"])
+            out.append(node)
     return out
 
 
@@ -190,19 +201,12 @@ def parse_product(raw: dict, categoria: str) -> dict | None:
         return None
     images = item.get("images") or []
     stock = int(offer.get("AvailableQuantity") or 0)
-    # Ruta de categoría más específica si existe
-    cats = raw.get("categories") or []
-    cat_name = categoria
-    if cats:
-        parts = [p for p in cats[0].split("/") if p]
-        if parts:
-            cat_name = parts[-1] if len(parts) < 2 else f"{parts[0]} / {parts[-1]}"
     return {
         "sku": str(item.get("itemId") or raw.get("productId")),
         "nombre": (raw.get("productName") or "").strip(),
         "marca": (raw.get("brand") or "").strip() or None,
         "precio_ref": price,
-        "categoria": cat_name,
+        "categoria": categoria,
         "imagen": images[0].get("imageUrl") if images else None,
         "url": raw.get("link") or None,
         "stock": stock,
@@ -210,7 +214,8 @@ def parse_product(raw: dict, categoria: str) -> dict | None:
     }
 
 
-def fetch_category_products(fetcher: Fetcher, cat_path: str, cat_name: str, max_pages: int | None) -> Iterable[dict]:
+def _paginate(fetcher: Fetcher, cat_path: str, categoria: str, max_pages: int | None) -> Iterable[tuple[bool, dict | None]]:
+    """Genera (es_resultado_crudo, producto_parseado|None) por cada resultado que devuelve VTEX."""
     start, page = 0, 0
     while start < VTEX_MAX_OFFSET:
         if max_pages and page >= max_pages:
@@ -221,19 +226,37 @@ def fetch_category_products(fetcher: Fetcher, cat_path: str, cat_name: str, max_
         if not data:
             break
         for raw in data:
-            parsed = parse_product(raw, cat_name)
-            if parsed:
-                yield parsed
+            yield True, parse_product(raw, categoria)
         if len(data) < PAGE_SIZE:
             break
         start += PAGE_SIZE
         page += 1
 
 
+def fetch_node(fetcher: Fetcher, node: dict, categoria: str, max_pages: int | None, seen: set[str]) -> Iterable[dict]:
+    """Productos de una categoría; si llega al tope de VTEX, baja a sus subcategorías."""
+    raw_count = 0
+    for _, parsed in _paginate(fetcher, node["path"], categoria, max_pages):
+        raw_count += 1
+        if parsed and parsed["sku"] not in seen:
+            seen.add(parsed["sku"])
+            yield parsed
+    if raw_count >= VTEX_MAX_OFFSET and not max_pages:
+        if node["children"]:
+            log.info("'%s' alcanzó el tope de %d: dividiendo en %d subcategorías",
+                     node["name"], VTEX_MAX_OFFSET, len(node["children"]))
+            for child in node["children"]:
+                yield from fetch_node(fetcher, child, categoria, max_pages, seen)
+        else:
+            log.warning("'%s' alcanzó el tope de %d y no tiene subcategorías: puede estar incompleta",
+                        node["name"], VTEX_MAX_OFFSET)
+
+
 # --------------------------------------------------------------------------- base de datos
-def upsert_product(db, p: dict) -> str:
-    """Upsert idempotente. Retorna 'nuevo' | 'cambio' | 'igual'."""
+def upsert_product(db, p: dict, hist: list[dict]) -> str:
+    """Upsert idempotente. Retorna 'nuevo' | 'cambio' | 'igual' y anota cambios de precio en `hist`."""
     new_price = round(p["precio_ref"] * (1 + MARKUP_PCT / 100), 2)
+    now = utcnow().isoformat()
     prod = db.query(Product).filter_by(sku=p["sku"]).one_or_none()
     if prod is None:
         prod = Product(
@@ -243,10 +266,12 @@ def upsert_product(db, p: dict) -> str:
         db.add(prod)
         db.flush()
         db.add(PriceHistory(producto_id=prod.id, precio_anterior=None, precio_nuevo=new_price))
+        hist.append({"sku": p["sku"], "fecha": now, "anterior": None, "nuevo": new_price})
         return "nuevo"
     changed = abs(prod.precio_chedraui_referencia - p["precio_ref"]) > 0.001
     if changed:
         db.add(PriceHistory(producto_id=prod.id, precio_anterior=prod.precio_actual, precio_nuevo=new_price))
+        hist.append({"sku": p["sku"], "fecha": now, "anterior": prod.precio_actual, "nuevo": new_price})
     prod.nombre, prod.marca = p["nombre"], p["marca"]
     prod.precio_actual, prod.precio_chedraui_referencia = new_price, p["precio_ref"]
     prod.categoria_supermercado, prod.url_imagen = p["categoria"], p["imagen"]
@@ -254,43 +279,53 @@ def upsert_product(db, p: dict) -> str:
     return "cambio" if changed else "igual"
 
 
-def export_json(db) -> str:
-    path = os.path.join(BASE_DIR, "data", "products.json")
-    rows = [p.to_dict() for p in db.query(Product).order_by(Product.categoria_supermercado, Product.nombre)]
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(rows, f, ensure_ascii=False, indent=1)
-    return path
-
-
 # --------------------------------------------------------------------------- orquestación
 def run_sync(use_browser: bool = False, max_pages: int | None = None,
              category_ids: list[str] | None = None) -> dict:
     init_db()
     fetcher = Fetcher(use_browser=use_browser)
-    stats = {"nuevo": 0, "cambio": 0, "igual": 0, "categorias": 0, "errores": 0}
+    stats = {"nuevo": 0, "cambio": 0, "igual": 0, "retirados": 0, "categorias": 0, "errores": 0}
     db = SessionLocal()
     try:
-        cats = ([(c, f"cat-{c}") for c in category_ids] if category_ids
+        seeded = seed_if_empty(db)
+        if seeded:
+            log.info("BD sembrada desde data/products.json (%d productos)", seeded)
+        cats = ([{"path": c, "name": f"cat-{c}", "children": []} for c in category_ids] if category_ids
                 else discover_categories(fetcher))
         if not cats:
             raise RuntimeError("No se encontraron categorías de supermercado. "
                                "Usa --categories o ajusta SUPER_ROOT_NAMES.")
-        log.info("Categorías de supermercado: %s", [n for _, n in cats])
+        log.info("Categorías de supermercado: %s", [c["name"] for c in cats])
         stats["categorias"] = len(cats)
-        for cat_path, cat_name in cats:
+        full_run = not max_pages and not category_ids
+        seen_skus: set[str] = set()
+        history: list[dict] = []
+        for node in cats:
+            cat_hist: list[dict] = []
+            cat_seen: set[str] = set()
+            cat_stats = {"nuevo": 0, "cambio": 0, "igual": 0}
             try:
-                n = 0
-                for p in fetch_category_products(fetcher, cat_path, cat_name, max_pages):
-                    stats[upsert_product(db, p)] += 1
-                    n += 1
-                if n == 0:
-                    log.warning("Categoría SIN productos: %s (ruta %s)", cat_name, cat_path)
+                for p in fetch_node(fetcher, node, node["name"], max_pages, cat_seen):
+                    cat_stats[upsert_product(db, p, cat_hist)] += 1
+                if not cat_seen:
+                    log.warning("Categoría SIN productos: %s (ruta %s)", node["name"], node["path"])
                 db.commit()
-                log.info("OK %s -> %s", cat_name, stats)
+                for k, v in cat_stats.items():
+                    stats[k] += v
+                history.extend(cat_hist)
+                seen_skus |= cat_seen
+                log.info("OK %s (%d productos) -> %s", node["name"], len(cat_seen), stats)
             except Exception:  # noqa: BLE001
                 db.rollback()
                 stats["errores"] += 1
-                log.exception("Fallo en categoría %s", cat_name)
+                log.exception("Fallo en categoría %s", node["name"])
+        if full_run and stats["errores"] == 0:
+            for prod in db.query(Product).filter(Product.disponible.is_(True)):
+                if prod.sku not in seen_skus:
+                    prod.disponible, prod.stock = False, 0
+                    stats["retirados"] += 1
+            db.commit()
+        append_history(history)
         export_json(db)
     finally:
         db.close()
@@ -303,7 +338,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Sync de precios Chedraui Supermercado")
     ap.add_argument("--browser", action="store_true", help="usar Playwright headless")
     ap.add_argument("--max-pages", type=int, default=None)
-    ap.add_argument("--categories", type=str, default=None, help="rutas separadas por coma, p. ej. 12/45,12/46 (o IDs simples)")
+    ap.add_argument("--categories", type=str, default=None,
+                    help="rutas separadas por coma, p. ej. 2/21,2/22 (o IDs simples)")
     args = ap.parse_args()
     ids = [x.strip() for x in args.categories.split(",") if x.strip()] if args.categories else None
     print(json.dumps(run_sync(args.browser, args.max_pages, ids), indent=2))
