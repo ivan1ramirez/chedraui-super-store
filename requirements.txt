@@ -1,0 +1,9 @@
+Flask>=3.0
+SQLAlchemy>=2.0
+requests>=2.31
+beautifulsoup4>=4.12
+python-dotenv>=1.0
+stripe>=8.0
+gunicorn>=22.0
+# Opcional (solo si el sitio exige renderizado JS / bloquea requests):
+# playwright>=1.44   ->  después ejecutar: playwright install chromium

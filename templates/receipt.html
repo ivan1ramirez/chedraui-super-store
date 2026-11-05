@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="es-MX">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Recibo #{{ o.id }} | Súper en Línea</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-800">
+  <main class="max-w-2xl mx-auto px-4 py-10">
+    <div class="bg-white border rounded-xl p-8">
+      {% if o.estado == 'pagado' %}
+        <p class="text-emerald-700 font-semibold">✅ Pago confirmado</p>
+      {% else %}
+        <p class="text-amber-700 font-semibold">⏳ Pedido {{ o.estado }}</p>
+      {% endif %}
+      <h1 class="text-2xl font-bold mt-1">Recibo #{{ '%06d' % o.id }}</h1>
+      <p class="text-sm text-slate-500">{{ o.creado_en.strftime('%d/%m/%Y %H:%M') }} UTC · Método: {{ o.metodo_pago }}</p>
+
+      <div class="mt-6 text-sm">
+        <p><strong>{{ o.nombre_cliente }}</strong> · {{ o.email }}</p>
+        <p class="text-slate-600">Entrega: {{ o.direccion }}</p>
+      </div>
+
+      <table class="w-full text-sm mt-6">
+        <thead><tr class="text-left border-b"><th class="py-2">Producto</th><th>Cant.</th><th class="text-right">Importe</th></tr></thead>
+        <tbody>
+        {% for l in lines %}
+          <tr class="border-b"><td class="py-2">{{ l.nombre }}</td><td>{{ l.qty }}</td><td class="text-right">${{ '{:,.2f}'.format(l.total) }}</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+
+      <div class="mt-4 text-sm space-y-1">
+        <div class="flex justify-between"><span>Subtotal</span><span>${{ '{:,.2f}'.format(o.subtotal) }}</span></div>
+        <div class="flex justify-between"><span>IVA</span><span>${{ '{:,.2f}'.format(o.impuestos) }}</span></div>
+        <div class="flex justify-between font-bold text-base"><span>Total MXN</span><span>${{ '{:,.2f}'.format(o.total) }}</span></div>
+      </div>
+
+      <div class="mt-8 flex gap-3 print:hidden">
+        <button onclick="window.print()" class="px-4 py-2 border rounded-lg">Imprimir</button>
+        <a href="/" class="px-4 py-2 bg-emerald-600 text-white rounded-lg">Volver a la tienda</a>
+      </div>
+    </div>
+  </main>
+</body>
+</html>

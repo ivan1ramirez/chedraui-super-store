@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="es-MX">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pago | Súper en Línea</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-800">
+  <header class="bg-white border-b">
+    <div class="max-w-5xl mx-auto px-4 py-3 flex justify-between items-center">
+      <a href="/" class="text-xl font-bold text-emerald-700">🛒 Súper en Línea</a>
+      <a href="/" class="text-sm text-emerald-700 underline">← Seguir comprando</a>
+    </div>
+  </header>
+
+  <main class="max-w-5xl mx-auto px-4 py-8 grid md:grid-cols-5 gap-8">
+    <form id="pay-form" class="md:col-span-3 space-y-4 bg-white border rounded-xl p-6" novalidate>
+      <h1 class="text-xl font-bold">Datos de entrega y pago</h1>
+
+      <div>
+        <label class="block text-sm font-medium mb-1" for="nombre">Nombre completo</label>
+        <input id="nombre" name="nombre" autocomplete="name" class="w-full border rounded-lg px-3 py-2" required>
+        <p class="err text-xs text-red-600 mt-1" data-for="nombre"></p>
+      </div>
+      <div>
+        <label class="block text-sm font-medium mb-1" for="email">Correo electrónico</label>
+        <input id="email" name="email" type="email" autocomplete="email" class="w-full border rounded-lg px-3 py-2" required>
+        <p class="err text-xs text-red-600 mt-1" data-for="email"></p>
+      </div>
+      <div>
+        <label class="block text-sm font-medium mb-1" for="direccion">Dirección de entrega</label>
+        <textarea id="direccion" name="direccion" rows="3" autocomplete="street-address"
+                  placeholder="Calle, número, colonia, ciudad, CP" class="w-full border rounded-lg px-3 py-2" required></textarea>
+        <p class="err text-xs text-red-600 mt-1" data-for="direccion"></p>
+      </div>
+
+      <div class="rounded-lg border p-4 bg-slate-50 text-sm">
+        <p class="font-semibold mb-1">Método de pago</p>
+        {% if stripe_enabled %}
+        <p>💳 Serás redirigido a <strong>Stripe Checkout</strong> (modo prueba: tarjeta <code>4242 4242 4242 4242</code>, cualquier fecha futura y CVC).</p>
+        {% else %}
+        <p>🧪 <strong>Pasarela simulada</strong>: no se cobra nada. Configura <code>STRIPE_SECRET_KEY</code> en <code>.env</code> para activar Stripe.</p>
+        {% endif %}
+      </div>
+
+      <label class="flex items-start gap-2 text-sm">
+        <input id="confirmo" type="checkbox" class="mt-1">
+        <span>Confirmo mi compra y que los datos de entrega son correctos.</span>
+      </label>
+      <p id="form-error" class="text-sm text-red-600"></p>
+
+      <button id="submit" type="submit" class="w-full bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded-lg py-3 font-semibold">
+        Pagar ahora
+      </button>
+    </form>
+
+    <aside class="md:col-span-2 bg-white border rounded-xl p-6 h-fit">
+      <h2 class="font-bold mb-3">Resumen</h2>
+      <div id="lines" class="space-y-2 text-sm mb-4"></div>
+      <div class="border-t pt-3 space-y-1 text-sm">
+        <div class="flex justify-between"><span>Subtotal</span><span id="sub">—</span></div>
+        <div class="flex justify-between"><span>IVA ({{ (iva_rate * 100)|round(0)|int }}%)</span><span id="iva">—</span></div>
+        <div class="flex justify-between font-bold text-base"><span>Total MXN</span><span id="total">—</span></div>
+      </div>
+    </aside>
+  </main>
+
+<script>
+const money = n => new Intl.NumberFormat('es-MX', {style:'currency', currency:'MXN'}).format(n);
+const cart = Object.values(JSON.parse(localStorage.getItem('cart') || '{}'));
+const items = cart.map(i => ({ id: i.id, qty: i.qty }));
+const $ = s => document.querySelector(s);
+
+async function loadQuote(){
+  if (!items.length) { $('#lines').innerHTML = '<p class="text-slate-500">Tu carrito está vacío.</p>'; $('#submit').disabled = true; return; }
+  const r = await fetch('/api/cart/quote', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({items}) });
+  const q = await r.json();
+  if (!r.ok) { $('#form-error').textContent = q.error; $('#submit').disabled = true; return; }
+  $('#lines').innerHTML = q.lines.map(l => {
+    const d = document.createElement('span'); d.textContent = `${l.qty} × ${l.nombre}`;
+    return `<div class="flex justify-between gap-2"><span class="flex-1">${d.innerHTML}</span><span>${money(l.total)}</span></div>`;
+  }).join('');
+  $('#sub').textContent = money(q.subtotal); $('#iva').textContent = money(q.iva); $('#total').textContent = money(q.total);
+}
+
+$('#pay-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  document.querySelectorAll('.err').forEach(p => p.textContent = ''); $('#form-error').textContent = '';
+  const cliente = { nombre: $('#nombre').value, email: $('#email').value, direccion: $('#direccion').value };
+  let bad = false;
+  if (cliente.nombre.trim().length < 3) { document.querySelector('[data-for=nombre]').textContent = 'Ingresa tu nombre completo'; bad = true; }
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(cliente.email.trim())) { document.querySelector('[data-for=email]').textContent = 'Correo inválido'; bad = true; }
+  if (cliente.direccion.trim().length < 10) { document.querySelector('[data-for=direccion]').textContent = 'Ingresa una dirección completa'; bad = true; }
+  if (!$('#confirmo').checked) { $('#form-error').textContent = 'Debes confirmar la compra.'; bad = true; }
+  if (bad) return;
+
+  $('#submit').disabled = true; $('#submit').textContent = 'Procesando…';
+  try {
+    const r = await fetch('/api/pay', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ items, cliente, confirmo: true }) });
+    const data = await r.json();
+    if (!r.ok) {
+      if (data.campos) for (const [k, v] of Object.entries(data.campos)) document.querySelector(`[data-for=${k}]`).textContent = v;
+      $('#form-error').textContent = data.error || 'No se pudo procesar el pago.';
+      $('#submit').disabled = false; $('#submit').textContent = 'Pagar ahora'; return;
+    }
+    localStorage.removeItem('cart');
+    window.location.href = data.url;
+  } catch (err) {
+    $('#form-error').textContent = 'Error de red. Intenta de nuevo.';
+    $('#submit').disabled = false; $('#submit').textContent = 'Pagar ahora';
+  }
+});
+
+loadQuote();
+</script>
+</body>
+</html>

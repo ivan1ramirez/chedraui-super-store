@@ -1,0 +1,7 @@
+.env
+venv/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+# data/store.db y data/products.json SÍ se versionan (los actualiza la GitHub Action)
