@@ -29,6 +29,8 @@ if STRIPE_SECRET_KEY:
     stripe = _stripe
 
 init_db()
+from datastore import seed_if_empty  # noqa: E402
+seed_if_empty()  # si la BD está vacía, se carga desde data/products.json
 _sync_lock = threading.Lock()
 
 
