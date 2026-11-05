@@ -12,7 +12,7 @@ Uso:
     python scraper.py                  # requests (rápido)
     python scraper.py --browser        # Playwright headless (si requests es bloqueado)
     python scraper.py --max-pages 2    # prueba corta
-    python scraper.py --categories 12,45   # IDs de categoría manuales (sobrescribe autodescubrimiento)
+    python scraper.py --categories 12/45,12/46   # rutas de categoría manuales (sobrescribe autodescubrimiento)
 
 NOTA: los endpoints son los típicos de VTEX; Chedraui puede cambiarlos o bloquear bots.
 Revisa los términos de uso del sitio y mantén un ritmo de peticiones bajo.
@@ -152,10 +152,11 @@ class Fetcher:
 
 
 # --------------------------------------------------------------------------- categorías
-def discover_categories(fetcher: Fetcher) -> list[tuple[int, str]]:
-    """Devuelve [(id, nombre_ruta)] de categorías hijas del departamento de supermercado."""
-    tree = fetcher.get_json(CATEGORY_TREE_URL.format(depth=3)) or []
-    result: list[tuple[int, str]] = []
+def discover_categories(fetcher: Fetcher, tree: list | None = None) -> list[tuple[str, str]]:
+    """Devuelve [(ruta_vtex, nombre)]; ruta = "idRaiz/idHija" para subcategorías (necesario en fq=C:/ruta/)."""
+    if tree is None:
+        tree = fetcher.get_json(CATEGORY_TREE_URL.format(depth=3)) or []
+    result: list[tuple[str, str]] = []
     for root in tree:
         root_name = norm(root.get("name", ""))
         if any(root_name == r or root_name.startswith(r) for r in SUPER_ROOT_NAMES):
@@ -163,11 +164,11 @@ def discover_categories(fetcher: Fetcher) -> list[tuple[int, str]]:
             if children:
                 for ch in children:
                     if not any(norm(k) in norm(ch["name"]) for k in EXCLUDE_KEYWORDS):
-                        result.append((ch["id"], ch["name"]))
+                        result.append((f'{root["id"]}/{ch["id"]}', ch["name"]))
             else:
                 result.append((root["id"], root["name"]))
         elif is_super_category(root.get("name", "")):
-            result.append((root["id"], root["name"]))  # raíz suelta tipo "Lácteos"
+            result.append((str(root["id"]), root["name"]))  # raíz suelta tipo "Lácteos"
     # dedup
     seen, out = set(), []
     for cid, name in result:
@@ -209,12 +210,12 @@ def parse_product(raw: dict, categoria: str) -> dict | None:
     }
 
 
-def fetch_category_products(fetcher: Fetcher, cat_id: int, cat_name: str, max_pages: int | None) -> Iterable[dict]:
+def fetch_category_products(fetcher: Fetcher, cat_path: str, cat_name: str, max_pages: int | None) -> Iterable[dict]:
     start, page = 0, 0
     while start < VTEX_MAX_OFFSET:
         if max_pages and page >= max_pages:
             break
-        params = {"fq": f"C:/{cat_id}/", "_from": start, "_to": start + PAGE_SIZE - 1}
+        params = {"fq": f"C:/{cat_path}/", "_from": start, "_to": start + PAGE_SIZE - 1}
         data = fetcher.get_json(SEARCH_URL, params=params)
         time.sleep(SLEEP_SECONDS)  # cortesía / evitar bloqueos
         if not data:
@@ -263,7 +264,7 @@ def export_json(db) -> str:
 
 # --------------------------------------------------------------------------- orquestación
 def run_sync(use_browser: bool = False, max_pages: int | None = None,
-             category_ids: list[int] | None = None) -> dict:
+             category_ids: list[str] | None = None) -> dict:
     init_db()
     fetcher = Fetcher(use_browser=use_browser)
     stats = {"nuevo": 0, "cambio": 0, "igual": 0, "categorias": 0, "errores": 0}
@@ -276,10 +277,14 @@ def run_sync(use_browser: bool = False, max_pages: int | None = None,
                                "Usa --categories o ajusta SUPER_ROOT_NAMES.")
         log.info("Categorías de supermercado: %s", [n for _, n in cats])
         stats["categorias"] = len(cats)
-        for cat_id, cat_name in cats:
+        for cat_path, cat_name in cats:
             try:
-                for p in fetch_category_products(fetcher, cat_id, cat_name, max_pages):
+                n = 0
+                for p in fetch_category_products(fetcher, cat_path, cat_name, max_pages):
                     stats[upsert_product(db, p)] += 1
+                    n += 1
+                if n == 0:
+                    log.warning("Categoría SIN productos: %s (ruta %s)", cat_name, cat_path)
                 db.commit()
                 log.info("OK %s -> %s", cat_name, stats)
             except Exception:  # noqa: BLE001
@@ -298,7 +303,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Sync de precios Chedraui Supermercado")
     ap.add_argument("--browser", action="store_true", help="usar Playwright headless")
     ap.add_argument("--max-pages", type=int, default=None)
-    ap.add_argument("--categories", type=str, default=None, help="IDs separados por coma")
+    ap.add_argument("--categories", type=str, default=None, help="rutas separadas por coma, p. ej. 12/45,12/46 (o IDs simples)")
     args = ap.parse_args()
-    ids = [int(x) for x in args.categories.split(",")] if args.categories else None
+    ids = [x.strip() for x in args.categories.split(",") if x.strip()] if args.categories else None
     print(json.dumps(run_sync(args.browser, args.max_pages, ids), indent=2))
